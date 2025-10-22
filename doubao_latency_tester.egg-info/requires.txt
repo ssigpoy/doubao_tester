@@ -1,0 +1,5 @@
+wxpython>=4.2.0
+requests>=2.28.0
+volcengine>=1.0.0
+pandas>=1.5.0
+matplotlib>=3.6.0
