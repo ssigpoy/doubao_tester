@@ -5,7 +5,8 @@ Summary: 豆包模型延迟测试工具
 Author-email: Your Name <your.email@example.com>
 Requires-Python: >=3.8
 Requires-Dist: wxpython>=4.2.0
-Requires-Dist: requests>=2.28.0
-Requires-Dist: volcengine>=1.0.0
+Requires-Dist: volcengine-python-sdk[ark]
 Requires-Dist: pandas>=1.5.0
 Requires-Dist: matplotlib>=3.6.0
+Requires-Dist: pydantic>=2.10.6
+Requires-Dist: httpx>=0.24.0

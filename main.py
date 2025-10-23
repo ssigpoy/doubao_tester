@@ -1,119 +1,180 @@
 import wx
 import wx.grid
-import requests
-import json
 import time
 import threading
 from datetime import datetime
 import pandas as pd
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, cast
 # matplotlib imports kept if you later want to plot results; currently unused
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigureCanvas
+from volcenginesdkarkruntime import Ark
+from volcenginesdkarkruntime._exceptions import ArkAPIError
+from volcenginesdkarkruntime._streaming import Stream
+from volcenginesdkarkruntime.types.chat import ChatCompletionMessageParam, completion_create_params
 
 class DouBaoTester:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # 保留原始 endpoint，请确认这是火山引擎提供的正确域名/路径
-        self.base_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-    def test_model(self, model_name: str, message: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
-        """测试单个模型的延迟"""
-        payload = {
-            "model": model_name,
-            "messages": [],
-            "stream": True
-        }
-        
-        # 添加系统提示词
-        if system_prompt:
-            payload["messages"].append({
-                "role": "system",
-                "content": system_prompt
-            })
-        
-        # 添加用户消息
-        payload["messages"].append({
-            "role": "user",
-            "content": message
-        })
-        
-        start_time = time.time()
-        first_token_time = None
-        full_response = ""
-        
-        try:
-            # Use connect/read timeouts tuple; stream decode_unicode for easier handling
-            response = requests.post(
-                self.base_url,
-                headers=self.headers,
-                json=payload,
-                stream=True,
-                timeout=(10, 60)
+        self.base_url = "https://ark.cn-beijing.volces.com/api/v3"
+        self._client_local = threading.local()
+
+    def _get_client(self) -> Ark:
+        client = getattr(self._client_local, "client", None)
+        if client is None:
+            self._client_local.client = Ark(
+                api_key=self.api_key,
+                base_url=self.base_url,
             )
-            response.raise_for_status()
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                # if server uses SSE style with 'data: ' prefix
-                if line.startswith('data: '):
-                    data = line[6:]
-                else:
-                    data = line
+            client = self._client_local.client
+        return client
 
-                if data == '[DONE]':
+    def list_models(self) -> List[str]:
+        client = self._get_client()
+        raw_response: Any = client.get("/models", cast_to=dict)
+
+        models: List[str] = []
+        if isinstance(raw_response, dict):
+            candidate_lists = []
+            for key in ("data", "models", "model_infos"):
+                value = raw_response.get(key)
+                if isinstance(value, list):
+                    candidate_lists = value
                     break
+            else:
+                candidate_lists = []
 
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    # skip non-json chunks
-                    continue
+            for entry in candidate_lists:
+                if isinstance(entry, dict):
+                    model_id = entry.get("id") or entry.get("model") or entry.get("model_id")
+                    if model_id:
+                        models.append(str(model_id))
+                elif isinstance(entry, str):
+                    models.append(entry)
 
-                if 'choices' in chunk and len(chunk['choices']) > 0:
-                    delta = chunk['choices'][0].get('delta', {})
-                    if 'content' in delta:
-                        content = delta['content']
-                        if content:
+        if not models and isinstance(raw_response, list):
+            for entry in raw_response:
+                if isinstance(entry, dict):
+                    model_id = entry.get("id") or entry.get("model") or entry.get("model_id")
+                    if model_id:
+                        models.append(str(model_id))
+                elif isinstance(entry, str):
+                    models.append(entry)
+
+        if not models:
+            raise RuntimeError("从API响应中未找到模型列表")
+
+        return models
+
+    def test_model(
+        self,
+        model_name: str,
+        message: str,
+        system_prompt: Optional[str] = None,
+        thinking_type: str = "disabled",
+    ) -> Dict[str, Any]:
+        """测试单个模型的延迟"""
+        messages: List[ChatCompletionMessageParam] = []
+        if system_prompt:
+            messages.append(cast(ChatCompletionMessageParam, {"role": "system", "content": system_prompt}))
+        messages.append(cast(ChatCompletionMessageParam, {"role": "user", "content": message}))
+
+        start_time = time.time()
+        first_token_time: Optional[float] = None
+        collected_parts: List[str] = []
+
+        thinking_payload: Optional[completion_create_params.Thinking] = None
+        if thinking_type in {"disabled", "enabled", "auto"}:
+            thinking_payload = cast(completion_create_params.Thinking, {"type": thinking_type})
+
+        client = self._get_client()
+
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                stream=True,
+                temperature=0.8,
+                max_tokens=512,
+                thinking=thinking_payload,
+            )
+
+            if isinstance(response, Stream):
+                with response as stream:
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        for choice in chunk.choices:
+                            delta = choice.delta
+                            if delta is None:
+                                continue
+                            piece = ""
+                            if getattr(delta, "reasoning_content", None):
+                                piece += delta.reasoning_content or ""
+                            if getattr(delta, "content", None):
+                                piece += delta.content or ""
+                            if not piece:
+                                continue
                             if first_token_time is None:
                                 first_token_time = time.time() - start_time
-                            full_response += content
-            
+                            collected_parts.append(piece)
+            else:
+                completion = response
+                if completion.choices:
+                    message_obj = completion.choices[0].message
+                    if message_obj and message_obj.content:
+                        collected_parts.append(message_obj.content)
+                        first_token_time = time.time() - start_time
+
             total_time = time.time() - start_time
-            
+            full_response = "".join(collected_parts)
+
             return {
                 "model": model_name,
-                # use None check to allow 0.0 values
                 "first_token_time": first_token_time if first_token_time is not None else total_time,
                 "total_time": total_time,
                 "success": True,
                 "response_length": len(full_response),
-                "timestamp": datetime.now()
+                "response_preview": full_response[:100] + "..." if len(full_response) > 100 else full_response,
+                "timestamp": datetime.now(),
             }
-            
+
+        except ArkAPIError as e:
+            return {
+                "model": model_name,
+                "first_token_time": None,
+                "total_time": None,
+                "success": False,
+                "error": f"Ark API 错误: {e}",
+                "timestamp": datetime.now(),
+            }
         except Exception as e:
             return {
                 "model": model_name,
                 "first_token_time": None,
                 "total_time": None,
                 "success": False,
-                "error": str(e),
-                "timestamp": datetime.now()
+                "error": f"未知错误: {e}",
+                "timestamp": datetime.now(),
             }
 
 class TestWorker(threading.Thread):
     """测试工作线程"""
-    def __init__(self, tester: DouBaoTester, models: List[str], message: str, 
-                 system_prompt: Optional[str], callback):
+    def __init__(
+        self,
+        tester: DouBaoTester,
+        models: List[str],
+        message: str,
+        system_prompt: Optional[str],
+        thinking_type: str,
+        callback,
+    ):
         super().__init__()
         self.tester = tester
         self.models = models
         self.message = message
         self.system_prompt = system_prompt
+        self.thinking_type = thinking_type
         self.callback = callback
         self._stop_event = threading.Event()
         
@@ -129,7 +190,12 @@ class TestWorker(threading.Thread):
                 "model": model
             })
             
-            result = self.tester.test_model(model, self.message, self.system_prompt)
+            result = self.tester.test_model(
+                model,
+                self.message,
+                self.system_prompt,
+                self.thinking_type,
+            )
             results.append(result)
             
             wx.CallAfter(self.callback, "result", result)
@@ -195,6 +261,20 @@ class LatencyTesterFrame(wx.Frame):
         self.tester = None
         self.worker = None
         self.results = []
+        self.default_models = [
+            "doubao-seed-1-6-251015",
+            "doubao-seed-1-6-vision-250815",
+            "doubao-seed-1-6-thinking-250615",
+            "doubao-seed-1-6-thinking-250715",
+            "doubao-seed-1-6-flash-250828",
+            "doubao-seed-1-6-flash-250615",
+            "doubao-seed-1-6-flash-250715",
+            "kimi-k2-250905",
+            "deepseek-v3-1-terminus",
+            "deepseek-v3-1-250821",
+        ]
+        self.current_models = self.default_models.copy()
+        self.model_fetch_thread: Optional[threading.Thread] = None
         
         self.init_ui()
         self.Centre()
@@ -205,31 +285,36 @@ class LatencyTesterFrame(wx.Frame):
         
         # API密钥输入
         api_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        api_sizer.Add(wx.StaticText(panel, label="API密钥:"), 0, wx.ALL | wx.ALIGN_CENTER, 5)
-        self.api_text = wx.TextCtrl(panel, style=wx.TE_PASSWORD, size=wx.Size(300, -1))
-        api_sizer.Add(self.api_text, 1, wx.ALL | wx.EXPAND, 5)
-        main_sizer.Add(api_sizer, 0, wx.EXPAND)
+        api_sizer.Add(wx.StaticText(panel, label="API Key:"), 0, wx.ALL | wx.ALIGN_CENTER, 5)
+        self.api_key_text = wx.TextCtrl(panel, style=wx.TE_PASSWORD, size=wx.Size(320, -1))
+        api_sizer.Add(self.api_key_text, 1, wx.ALL | wx.EXPAND, 5)
         
+        main_sizer.Add(api_sizer, 0, wx.EXPAND)
         # 模型选择
         model_sizer = wx.BoxSizer(wx.HORIZONTAL)
         model_sizer.Add(wx.StaticText(panel, label="测试模型:"), 0, wx.ALL | wx.ALIGN_CENTER, 5)
-        
-        self.model_list = wx.CheckListBox(panel, choices=[
-            "doubao-code-245m-2409",
-            "doubao-code-245m-2409-instruct",
-            "doubao-code-245m-2409-online",
-            "doubao-1-5-245m-2410",
-            "doubao-1-5-245m-2410-instruct",
-            "doubao-1-5-245m-2410-online",
-            "doubao-1-5-245m-2410-vl",
-            "doubao-1-5-245m-2410-vl-instruct",
-            "doubao-1-5-245m-2410-vl-online",
-            "doubao-1-5-245m-2410-search",
-            "doubao-1-5-245m-2410-search-instruct",
-            "doubao-1-5-245m-2410-search-online"
-        ])
+
+        self.model_list = wx.CheckListBox(panel, choices=self.current_models.copy())
         self.model_list.SetMinSize(wx.Size(-1, 120))
-        model_sizer.Add(self.model_list, 1, wx.ALL | wx.EXPAND, 5)
+
+        model_controls = wx.BoxSizer(wx.VERTICAL)
+        model_controls.Add(self.model_list, 1, wx.ALL | wx.EXPAND, 5)
+
+        model_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self.select_all_btn = wx.Button(panel, label="全选")
+        self.clear_selection_btn = wx.Button(panel, label="全不选")
+        self.edit_models_btn = wx.Button(panel, label="编辑列表")
+        self.load_models_btn = wx.Button(panel, label="从API获取模型")
+
+        model_buttons.Add(self.select_all_btn, 0, wx.RIGHT, 5)
+        model_buttons.Add(self.clear_selection_btn, 0, wx.RIGHT, 5)
+        model_buttons.Add(self.edit_models_btn, 0, wx.RIGHT, 5)
+        model_buttons.AddStretchSpacer()
+        model_buttons.Add(self.load_models_btn, 0)
+
+        model_controls.Add(model_buttons, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 5)
+
+        model_sizer.Add(model_controls, 1, wx.EXPAND)
         main_sizer.Add(model_sizer, 0, wx.EXPAND)
         
         # 系统提示词
@@ -243,6 +328,17 @@ class LatencyTesterFrame(wx.Frame):
         )
         prompt_sizer.Add(self.prompt_text, 1, wx.ALL | wx.EXPAND, 5)
         main_sizer.Add(prompt_sizer, 0, wx.EXPAND)
+
+        thinking_choices = ["关闭", "自动", "开启"]
+        self.thinking_radio = wx.RadioBox(
+            panel,
+            label="深度思考",
+            choices=thinking_choices,
+            majorDimension=3,
+            style=wx.RA_SPECIFY_COLS,
+        )
+        self.thinking_radio.SetSelection(0)
+        main_sizer.Add(self.thinking_radio, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         
         # 用户输入
         input_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -277,17 +373,21 @@ class LatencyTesterFrame(wx.Frame):
         self.start_btn.Bind(wx.EVT_BUTTON, self.on_start_test)
         self.stop_btn.Bind(wx.EVT_BUTTON, self.on_stop_test)
         self.export_btn.Bind(wx.EVT_BUTTON, self.on_export_results)
+        self.load_models_btn.Bind(wx.EVT_BUTTON, self.on_load_models)
+        self.select_all_btn.Bind(wx.EVT_BUTTON, self.on_select_all_models)
+        self.clear_selection_btn.Bind(wx.EVT_BUTTON, self.on_clear_model_selection)
+        self.edit_models_btn.Bind(wx.EVT_BUTTON, self.on_edit_models)
         
         panel.SetSizer(main_sizer)
         
     def on_start_test(self, event):
         """开始测试"""
-        api_key = self.api_text.GetValue().strip()
+        api_key = self.api_key_text.GetValue().strip()
         if not api_key:
-            wx.MessageBox("请输入API密钥", "错误", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox("请输入API Key", "错误", wx.OK | wx.ICON_ERROR)
             return
             
-        selected_models = self.model_list.GetCheckedStrings()
+        selected_models = list(self.model_list.GetCheckedStrings())
         if not selected_models:
             wx.MessageBox("请选择至少一个测试模型", "错误", wx.OK | wx.ICON_ERROR)
             return
@@ -297,6 +397,9 @@ class LatencyTesterFrame(wx.Frame):
             wx.MessageBox("请输入用户对话内容", "错误", wx.OK | wx.ICON_ERROR)
             return
             
+        thinking_type = self.get_selected_thinking_type()
+        prompt_value = self.prompt_text.GetValue()
+
         # 初始化测试器
         self.tester = DouBaoTester(api_key)
         
@@ -305,7 +408,8 @@ class LatencyTesterFrame(wx.Frame):
             self.tester,
             selected_models,
             user_input,
-            self.prompt_text.GetValue(),
+            prompt_value,
+            thinking_type,
             self.on_worker_callback
         )
         
@@ -342,7 +446,108 @@ class LatencyTesterFrame(wx.Frame):
                 wx.MessageBox(f"结果已导出到: {filename}", "成功", wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 wx.MessageBox(f"导出失败: {str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+
+    def on_load_models(self, event):
+        """从API拉取可用模型列表"""
+        api_key = self.api_key_text.GetValue().strip()
+        if not api_key:
+            wx.MessageBox("请先输入API Key", "错误", wx.OK | wx.ICON_ERROR)
+            return
+
+        if self.model_fetch_thread and self.model_fetch_thread.is_alive():
+            wx.MessageBox("模型列表正在加载，请稍候", "提示", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        self.load_models_btn.Disable()
+        self.progress_text.SetLabel("正在加载模型列表...")
+
+        def worker():
+            tester = DouBaoTester(api_key)
+            try:
+                models = tester.list_models()
+                wx.CallAfter(self.on_models_loaded, True, models)
+            except Exception as exc:
+                wx.CallAfter(self.on_models_loaded, False, str(exc))
+
+        self.model_fetch_thread = threading.Thread(target=worker, daemon=True)
+        self.model_fetch_thread.start()
+
+    def on_models_loaded(self, success: bool, payload: Any):
+        self.load_models_btn.Enable()
+
+        if success:
+            models = payload if isinstance(payload, list) else []
+            if not models:
+                self.progress_text.SetLabel("API返回空模型列表")
+                wx.MessageBox("API未返回任何模型", "提示", wx.OK | wx.ICON_INFORMATION)
+                return
+
+            previous_checked = list(self.model_list.GetCheckedStrings())
+            self.update_model_list(models, previous_checked)
+            self.progress_text.SetLabel(f"已加载模型 {len(self.current_models)} 个")
+        else:
+            self.progress_text.SetLabel("模型加载失败")
+            wx.MessageBox(f"加载模型失败: {payload}", "错误", wx.OK | wx.ICON_ERROR)
                 
+    def on_select_all_models(self, event):
+        count = self.model_list.GetCount()
+        if count:
+            self.model_list.SetCheckedItems(list(range(count)))
+
+    def on_clear_model_selection(self, event):
+        self.model_list.SetCheckedItems([])
+
+    def on_edit_models(self, event):
+        current_value = "\n".join(self.current_models)
+        dialog = wx.TextEntryDialog(
+            self,
+            "每行一个模型 ID",
+            "编辑测试模型列表",
+            value=current_value,
+            style=wx.TE_MULTILINE,
+        )
+        dialog.SetSize(wx.Size(400, 320))
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                raw_value = dialog.GetValue()
+                new_models = [line.strip() for line in raw_value.splitlines() if line.strip()]
+                if not new_models:
+                    wx.MessageBox("模型列表不能为空", "错误", wx.OK | wx.ICON_ERROR)
+                    return
+                previous_checked = list(self.model_list.GetCheckedStrings())
+                self.update_model_list(new_models, previous_checked)
+                self.progress_text.SetLabel(f"模型数量: {len(self.current_models)}")
+        finally:
+            dialog.Destroy()
+
+    def update_model_list(self, models: List[str], checked: Optional[List[str]] = None) -> None:
+        unique_models: List[str] = []
+        seen = set()
+        for model in models:
+            name = model.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            unique_models.append(name)
+
+        self.current_models = unique_models
+        self.model_list.Clear()
+
+        if unique_models:
+            self.model_list.AppendItems(unique_models)
+            if checked:
+                checked_set = set(checked)
+                to_check = [item for item in unique_models if item in checked_set]
+                if to_check:
+                    self.model_list.SetCheckedStrings(to_check)
+        else:
+            self.model_list.SetCheckedItems([])
+
+    def get_selected_thinking_type(self) -> str:
+        mapping = {0: "disabled", 1: "auto", 2: "enabled"}
+        selection = self.thinking_radio.GetSelection()
+        return mapping.get(selection, "disabled")
+
     def on_worker_callback(self, msg_type: str, data: Any):
         """工作线程回调"""
         if msg_type == "progress":
